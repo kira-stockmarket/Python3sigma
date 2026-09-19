@@ -224,3 +224,97 @@ if st.session_state.breakout_df is not None:
                     st.info("No recent news articles found via Yahoo Finance.")
             except Exception:
                 st.info("Unable to retrieve news feeds at this time.")
+
+st.markdown("---")
+st.header("🔄 Strategy Backtester")
+st.write("Simulate the 3-Sigma + Volume strategy on historical data.")
+
+# Backtest UI Controls
+col1, col2, col3 = st.columns(3)
+with col1:
+    test_symbol = st.selectbox("Select Stock to Backtest:", symbols, index=symbols.index("SPLPETRO.NS") if "SPLPETRO.NS" in symbols else 0)
+with col2:
+    hold_days = st.number_input("Holding Period (Days):", min_value=1, max_value=30, value=10)
+with col3:
+    test_years = st.slider("Historical Data (Years):", 1, 5, 2)
+
+if st.button("Run Historical Backtest", type="primary"):
+    with st.spinner(f"Running backtest for {test_symbol} over {test_years} years..."):
+        try:
+            # 1. Download Historical Data
+            df = yf.download(test_symbol, period=f"{test_years}y", progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df.droplevel(1, axis=1) # Flatten columns
+                
+            df['Returns'] = df['Close'].pct_change() * 100
+            
+            # 2. Calculate Rolling 90-Day Metrics
+            df['Mean_90'] = df['Returns'].rolling(window=90).mean()
+            df['Std_90'] = df['Returns'].rolling(window=90).std()
+            df['Upper_3SD'] = df['Mean_90'] + (3 * df['Std_90'])
+            df['Avg_Vol_90'] = df['Volume'].rolling(window=90).mean().shift(1)
+            
+            # 3. Define Strategy Conditions
+            df['Is_3SD_Cross'] = df['Returns'] > df['Upper_3SD']
+            df['Is_Vol_Spike'] = df['Volume'] > (2.0 * df['Avg_Vol_90']) # 2x Volume filter
+            
+            # Find Signal Days
+            df['Signal'] = df['Is_3SD_Cross'] & df['Is_Vol_Spike']
+            signal_dates = df[df['Signal']].index
+            
+            # 4. Execute Trades
+            trades = []
+            for date in signal_dates:
+                loc = df.index.get_loc(date)
+                
+                # Ensure we have enough days left in the dataset to hold and sell
+                if loc + hold_days < len(df):
+                    entry_price = df.iloc[loc + 1]['Open'] # Buy next day open
+                    exit_price = df.iloc[loc + hold_days]['Close'] # Sell after N days close
+                    stop_loss_price = df.iloc[loc]['Low'] # Stop loss at breakout candle low
+                    
+                    # Check if stop loss was hit during the holding period
+                    holding_period_lows = df.iloc[loc+1 : loc+hold_days+1]['Low']
+                    stop_hit = (holding_period_lows < stop_loss_price).any()
+                    
+                    if stop_hit:
+                        # Find the exact day the stop was hit for realistic exit calculation
+                        stop_date = holding_period_lows[holding_period_lows < stop_loss_price].index[0]
+                        actual_exit = stop_loss_price
+                        status = "Stop Loss"
+                    else:
+                        actual_exit = exit_price
+                        status = "Take Profit / Time Exit"
+                        
+                    trade_return = ((actual_exit - entry_price) / entry_price) * 100
+                    
+                    trades.append({
+                        "Entry Date": df.index[loc+1].strftime('%Y-%m-%d'),
+                        "Entry Price": round(entry_price, 2),
+                        "Exit Price": round(actual_exit, 2),
+                        "Return (%)": round(trade_return, 2),
+                        "Outcome": status
+                    })
+            
+            # 5. Display Results
+            if trades:
+                trades_df = pd.DataFrame(trades)
+                wins = len(trades_df[trades_df['Return (%)'] > 0])
+                total_trades = len(trades_df)
+                win_rate = (wins / total_trades) * 100
+                avg_return = trades_df['Return (%)'].mean()
+                
+                st.success(f"Backtest Complete: Found {total_trades} trade setups.")
+                
+                # Metrics layout
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total Trades", total_trades)
+                m2.metric("Win Rate", f"{win_rate:.1f}%")
+                m3.metric("Average Return per Trade", f"{avg_return:.2f}%")
+                
+                st.dataframe(trades_df, use_container_width=True)
+            else:
+                st.warning("No strategy signals found for this stock in the selected timeframe.")
+                
+        except Exception as e:
+            st.error(f"Error running backtest: {e}")
